@@ -1,4 +1,4 @@
-Con đường nhanh nhất để vươn lên sau khi thoát cảnh Fresher...
+
 # xxxx.com — Flash Sale Ticket System
 
 Project thực hành xây dựng hệ thống đặt vé flash sale chịu tải cao theo DDD. Bài toán chính là bán vé sự kiện — stock giới hạn, nhiều người đặt cùng lúc, không được oversell, server không được sập.
