@@ -1,0 +1,19 @@
+{
+  "name": "flash",
+  "version": "1.0.0",
+  "description": "Project thực hành xây dựng hệ thống đặt vé flash sale chịu tải cao theo DDD. Bài toán chính là bán vé sự kiện — stock giới hạn, nhiều người đặt cùng lúc, không được oversell, server không được sập.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@upstash/qstash": "^2.11.3",
+    "@upstash/redis": "^1.38.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.22.0"
+  }
+}
