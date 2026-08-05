@@ -2,7 +2,33 @@ require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
 const { Redis } = require('@upstash/redis');
+const { spawn } = require('child_process');
 const { Client: QStashClient } = require('@upstash/qstash');
+
+function startLocalQStash() {
+  const isWindows = process.platform === 'win32';
+  const npxCmd = isWindows ? 'npx.cmd' : 'npx';
+
+  console.log('🔄 Đang khởi động QStash Local CLI trên cổng 4000...');
+
+  // Chạy lệnh: npx @upstash/qstash-cli@latest dev --port 4000
+  const qstashProcess = spawn(npxCmd, ['@upstash/qstash-cli@latest', 'dev', '--port', '4000'], {
+    stdio: 'inherit', // In trực tiếp log của QStash CLI ra màn hình Terminal hiện tại
+    shell: true,
+  });
+
+  // Tự động tắt QStash CLI khi bạn nhấn Ctrl+C để dừng Node.js server
+  process.on('SIGINT', () => {
+    console.log('\n🛑 Đang tắt QStash Local CLI...');
+    qstashProcess.kill();
+    process.exit();
+  });
+}
+// Bật QStash CLI (Chỉ bật khi đang chạy ở môi trường Local)
+const isLocal = process.env.QSTASH_URL?.includes('127.0.0.1') || process.env.QSTASH_URL?.includes('localhost');
+if (isLocal) {
+  startLocalQStash();
+}
 
 const app = express();
 app.use(express.json());
@@ -12,8 +38,6 @@ app.use(express.urlencoded({ extended: true }));
 // Khởi tạo các kết nối Cloud
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const redis = Redis.fromEnv();
-const isLocal = process.env.QSTASH_URL?.includes('127.0.0.1') || process.env.QSTASH_URL?.includes('localhost');
-
 const qstash = new QStashClient({
   baseUrl: process.env.QSTASH_URL,
   token: process.env.QSTASH_TOKEN,
@@ -24,32 +48,55 @@ const qstash = new QStashClient({
 // 🚀 1. API RECEIVER: Tiếp nhận mua vé & Trừ kho Redis (Thời gian phản hồi ~20ms)
 // =========================================================================
 app.post('/api/buy-ticket', async (req, res) => {
-    // Kiểm tra nếu không có req.body
-  if (!req.body) {
-    return res.status(400).json({ success: false, error: 'Thiếu Request Body!' });
+  if (!req.body || !Array.isArray(req.body.items) || req.body.items.length === 0) {
+    return res.status(400).json({ success: false, error: 'Danh sách vé mua (items) không hợp lệ!' });
   }
-  const { user_id, ticket_id } = req.body;
-  const stockKey = `ticket:${ticket_id}:stock`;
+
+  const { user_id, items } = req.body;
+  const deductedItems = []; // Mảng lưu các item đã trừ thành công để Rollback khi cần
 
   try {
-    // TẦNG 1: Trừ kho Atomic trên Redis
-    const stockLeft = await redis.decr(stockKey);
+    let isStockOut = false;
+    let failedTicketId = null;
+    let remainingOfFailed = 0;
 
-    // Nếu kho âm (Hết vé)
-    if (stockLeft < 0) {
-      // Hoàn lại kho cho chuẩn số 0
-      await redis.incr(stockKey);
+    // TẦNG 1: Duyệt qua từng loại vé và trừ kho trên Redis
+    for (const item of items) {
+      const ticketId = parseInt(item.ticket_id, 10);
+      const buyQty = parseInt(item.quantity, 10);
+
+      if (isNaN(buyQty) || buyQty <= 0) continue;
+
+      const stockKey = `ticket:${ticketId}:stock`;
+      const stockLeft = await redis.decrby(stockKey, buyQty);
+
+      if (stockLeft < 0) {
+        // Hết kho ở loại vé này!
+        isStockOut = true;
+        failedTicketId = ticketId;
+        remainingOfFailed = stockLeft + buyQty;
+        // Cộng trả lại vé vừa trừ bị âm
+        await redis.incrby(stockKey, buyQty);
+        break;
+      }
+
+      // Lưu lại thông tin đã trừ thành công để đề phòng bị thất bại ở vé sau
+      deductedItems.push({ ticketId, stockKey, buyQty });
+    }
+
+    // NẾU CÓ 1 LOẠI VÉ BỊ HẾT KHO -> ROLLBACK TOÀN BỘ CÁC VÉ ĐÃ TRỪ TRƯỚC ĐÓ
+    if (isStockOut) {
+      for (const item of deductedItems) {
+        await redis.incrby(item.stockKey, item.buyQty); // Hoàn vé về Redis
+      }
       return res.status(400).json({
         success: false,
-        message: '❌ Rất tiếc, vé đã được bán hết!',
+        message: `❌ Không đủ số lượng cho Vé ID [${failedTicketId}]! Kho chỉ còn ${remainingOfFailed} vé.`,
       });
     }
 
-    // Tạo mã đơn hàng duy nhất
+    // TẦNG 2: Nếu tất cả loại vé đều còn đủ kho -> Bắn gói tin Dynamic sang QStash Queue
     const orderCode = `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-    // TẦNG 2: Ném đơn hàng sang QStash Queue (Chờ Worker xử lý ngầm)
-    // Lưu ý: Target URL chính là endpoint Worker của chúng ta
     const workerTargetUrl = `${process.env.MY_WORKER_BASE_URL}`;
 
     const qstashRes = await qstash.publishJSON({
@@ -57,21 +104,23 @@ app.post('/api/buy-ticket', async (req, res) => {
       body: {
         order_code: orderCode,
         user_id: user_id,
-        ticket_id: ticket_id,
+        items: items, // 👈 Gửi toàn bộ danh sách items dynamic sang Worker
       },
     });
 
-    // Trả lời phản hồi cho User NGAY LẬP TỨC!
     return res.status(200).json({
       success: true,
-      message: '🎉 Đặt vé thành công! Đang khởi tạo hóa đơn...',
+      message: `🎉 Đặt thành công ${items.length} loại vé! Đang khởi tạo hóa đơn...`,
       order_code: orderCode,
-      queue_msg_id: qstashRes.messageId,
-      remaining_stock: stockLeft,
+      bought_items: items,
     });
 
   } catch (error) {
-    console.error('❌ Lỗi xử lý Mua vé:', error.message);
+    // Nếu có lỗi hệ thống -> Rollback lại toàn bộ kho đã trừ
+    for (const item of deductedItems) {
+      await redis.incrby(item.stockKey, item.buyQty);
+    }
+    console.error('❌ Lỗi xử lý Mua vé Dynamic:', error.message);
     return res.status(500).json({ success: false, error: 'Lỗi máy chủ' });
   }
 });
@@ -80,32 +129,39 @@ app.post('/api/buy-ticket', async (req, res) => {
 // 👷 2. WORKER ENDPOINT: QStash gọi về đây để ghi đơn chính thức vào Postgres
 // =========================================================================
 app.post('/api/worker/process-order', async (req, res) => {
-  const { order_code, user_id, ticket_id } = req.body;
+  const { order_code, user_id, items } = req.body;
 
-  console.log(`👷 WORKER: Đang xử lý đơn hàng [${order_code}]...`);
+  console.log(`👷 WORKER: Đang xử lý đơn hàng Dynamic [${order_code}] gồm ${items.length} mặt hàng...`);
+
+  const client = await pool.connect();
 
   try {
-    // Ghi chính thức vào Neon Postgres DB
-    await pool.query(
-      'INSERT INTO orders (order_code, user_id, ticket_id) VALUES ($1, $2, $3)',
-      [order_code, user_id, ticket_id]
-    );
+    await client.query('BEGIN'); // Bắt đầu Transaction
 
-    console.log(`✅ WORKER: Ghi thành công đơn [${order_code}] vào Postgres!`);
-    
-    // Báo cho QStash biết đã hoàn thành (Mã 200)
+    // Lặp qua danh sách items và Insert từng dòng vào bảng orders
+    for (const item of items) {
+      await client.query(
+        'INSERT INTO orders (order_code, user_id, ticket_id, quantity) VALUES ($1, $2, $3, $4)',
+        [order_code, user_id, item.ticket_id, item.quantity]
+      );
+    }
+
+    await client.query('COMMIT'); // Xác nhận lưu thành công toàn bộ
+    console.log(`✅ WORKER: Đã ghi thành công toàn bộ items của đơn [${order_code}] vào Postgres!`);
+
     return res.status(200).json({ success: true, status: 'DELIVERED_TO_DB' });
 
   } catch (error) {
-    // Nếu bị trùng khóa order_code (Postgres khóa unique)
+    await client.query('ROLLBACK'); // Hủy bỏ nếu có lỗi
+
     if (error.code === '23505') {
-      console.warn(`⚠️ WORKER: Đơn hàng [${order_code}] đã tồn tại (Chống ghi trùng thành công).`);
       return res.status(200).json({ message: 'Order already processed' });
     }
 
     console.error('❌ WORKER LỖI GHI DB:', error.message);
-    // Trả về 500 để QStash biết và tự động RETRY lại sau!
     return res.status(500).json({ error: 'Database write failed' });
+  } finally {
+    client.release(); // Giải phóng kết nối DB
   }
 });
 
