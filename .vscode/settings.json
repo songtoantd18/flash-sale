@@ -1,0 +1,20 @@
+{
+  // Tắt gợi ý tự động (IntelliSense) của VS Code
+  "editor.quickSuggestions": {
+    "other": "off",
+    "comments": "off",
+    "strings": "off"
+  },
+  "editor.suggestOnTriggerCharacters": false,
+  "editor.acceptSuggestionOnEnter": "off",
+  "editor.parameterHints.enabled": false,
+
+  // Tắt các gợi ý dạng chữ mờ (Ghost Text) từ AI (Gemini, Copilot, Tabnine, v.v.)
+  "editor.inlineSuggest.enabled": false,
+  "github.copilot.enable": {
+    "*": false
+  },
+  "google.gemini.enableCodeCompletion": false,
+  "cloudcode.duetAI.enablecodecompletion": false,
+  "chat.disableAIFeatures": true
+}
